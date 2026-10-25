@@ -31,6 +31,12 @@ type EglInstance = khronos_egl::Instance<khronos_egl::Static>;
 
 type EglLabel = *const ffi::c_void;
 
+type EglPresentationTimeFun = unsafe extern "system" fn(
+    display: *mut ffi::c_void,
+    surface: *mut ffi::c_void,
+    time: i64,
+) -> khronos_egl::Boolean;
+
 #[allow(clippy::upper_case_acronyms)]
 type EGLDEBUGPROCKHR = Option<
     unsafe extern "system" fn(
@@ -175,6 +181,7 @@ struct EglContext {
     display: khronos_egl::Display,
     raw: khronos_egl::Context,
     pbuffer: Option<khronos_egl::Surface>,
+    presentation_time: Option<EglPresentationTimeFun>,
 }
 
 impl EglContext {
@@ -419,6 +426,18 @@ impl Inner {
             display_extensions.split_whitespace().collect::<Vec<_>>()
         );
 
+        let presentation_time = display_extensions
+            .split_whitespace()
+            .any(|extension| extension == "EGL_ANDROID_presentation_time")
+            .then(|| egl.get_proc_address("eglPresentationTimeANDROID"))
+            .flatten()
+            .map(|address| {
+                // SAFETY: the advertised EGL extension defines this function with this ABI.
+                unsafe {
+                    core::mem::transmute::<extern "system" fn(), EglPresentationTimeFun>(address)
+                }
+            });
+
         let srgb_kind = if version >= (1, 5) {
             log::debug!("\tEGL surface: +srgb");
             SrgbFrameBufferKind::Core
@@ -641,6 +660,7 @@ impl Inner {
                 raw: context,
                 pbuffer,
                 version,
+                presentation_time,
             },
             version,
             supports_native_window,
@@ -1109,6 +1129,39 @@ unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
 impl Surface {
+    /// Sets the presentation timestamp for subsequent swaps using `EGL_ANDROID_presentation_time`.
+    ///
+    /// Call this after configuring the surface and before presenting. The timestamp is in
+    /// nanoseconds; for Android display surfaces it uses the monotonic clock (`System.nanoTime()`).
+    /// On Android, `i64::MIN` restores automatic timestamps.
+    ///
+    /// Returns an error if the extension is unavailable, the surface is unconfigured, or EGL
+    /// rejects the timestamp. No EGL context needs to be current on the calling thread.
+    pub fn set_presentation_time(&self, timestamp: i64) -> Result<(), crate::SurfaceError> {
+        let function = self
+            .egl
+            .presentation_time
+            .ok_or(crate::SurfaceError::Other(
+                "EGL_ANDROID_presentation_time is unavailable",
+            ))?;
+        let swapchain = self.swapchain.write();
+        let sc = swapchain.as_ref().ok_or(crate::SurfaceError::Other(
+            "Surface has no swap-chain configured",
+        ))?;
+        // SAFETY: the swapchain lock keeps the surface alive and excludes concurrent presentation.
+        let result = unsafe { function(self.egl.display.as_ptr(), sc.surface.as_ptr(), timestamp) };
+        if result == khronos_egl::FALSE {
+            log::error!(
+                "eglPresentationTimeANDROID failed: {:?}",
+                self.egl.instance.get_error()
+            );
+            return Err(crate::SurfaceError::Other(
+                "eglPresentationTimeANDROID failed",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) unsafe fn present(
         &self,
         _suf_texture: super::Texture,

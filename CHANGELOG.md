@@ -42,6 +42,12 @@ Bottom level categories:
 
 ## Unreleased
 
+### Added
+
+#### GLES / OpenGL
+
+- Add `wgpu_hal::gles::Surface::set_presentation_time` for EGL surfaces supporting `EGL_ANDROID_presentation_time`.
+
 ### Bug Fixes
 
 #### Vulkan
